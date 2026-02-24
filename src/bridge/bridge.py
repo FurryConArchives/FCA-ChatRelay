@@ -111,6 +111,21 @@ class BridgeApp:
             self.logger.info("Fluxer connected as %s", self.fluxer_bot.user)
 
         @self.fluxer_bot.event
+        async def on_member_join(member):
+            # Relay to Discord and Telegram
+            join_msg = f"📌 {getattr(member, 'username', 'Unknown')} joined the Fluxer Chat"
+            for mapping in self.config.bridges:
+                await self._send_to_discord_channels(mapping, join_msg, join_msg, [], "System", None)
+                await self._send_to_telegram_text(mapping, join_msg)
+
+        @self.fluxer_bot.event
+        async def on_member_remove(member):
+            leave_msg = f"📍 {getattr(member, 'username', 'Unknown')} left the Fluxer Chat"
+            for mapping in self.config.bridges:
+                await self._send_to_discord_channels(mapping, leave_msg, leave_msg, [], "System", None)
+                await self._send_to_telegram_text(mapping, leave_msg)
+
+        @self.fluxer_bot.event
         async def on_message(message):
             self.logger.debug(f"[Fluxer] Received message: {getattr(message, 'content', None)} from {getattr(message.author, 'username', None)} in channel {getattr(message, 'channel_id', None)}")
             if self._is_fluxer_webhook(message):
@@ -860,6 +875,64 @@ class BridgeApp:
             self.logger.info(f"Relaying Discord message: {content[:60] if content else 'attachments only'}")
             await self._send_to_telegram_chats(mapping, content, message.attachments)
             await self.discord_bot.process_commands(message)
+
+        @self.discord_bot.event
+        async def on_member_join(member):
+            # Relay to Telegram and Fluxer
+            for mapping in self.config.bridges:
+                join_msg = f"📌 {member.display_name or member.name} joined the DiscorD Chat"
+                await self._send_to_telegram_text(mapping, join_msg)
+                if hasattr(mapping, 'fluxer_webhook'):
+                    fluxer_webhooks = getattr(mapping, 'fluxer_webhook', {})
+                    for fid, webhook_url in fluxer_webhooks.items():
+                        if not webhook_url:
+                            continue
+                        session = await self._get_fluxer_session()
+                        api_base = "https://api.fluxer.app"
+                        url = f"{api_base}/webhooks/{fid}/{webhook_url}?wait=true"
+                        form = aiohttp.FormData()
+                        form_payload = {
+                            "username": "System",
+                            "avatar_url": None,
+                            "content": join_msg,
+                            "attachments": [],
+                        }
+                        form.add_field("payload_json", json.dumps(form_payload), content_type="application/json")
+                        try:
+                            async with session.post(url, data=form) as r:
+                                if r.status not in [200, 201]:
+                                    self.logger.warning(f"[D->F] Join relay failed: {r.status} {await r.text()}")
+                        except Exception as exc:
+                            self.logger.warning(f"[D->F] Exception posting join to Fluxer: {exc}")
+
+        @self.discord_bot.event
+        async def on_member_remove(member):
+            # Relay to Telegram and Fluxer
+            for mapping in self.config.bridges:
+                leave_msg = f"📍 {member.display_name or member.name} left the Discord Chat"
+                await self._send_to_telegram_text(mapping, leave_msg)
+                if hasattr(mapping, 'fluxer_webhook'):
+                    fluxer_webhooks = getattr(mapping, 'fluxer_webhook', {})
+                    for fid, webhook_url in fluxer_webhooks.items():
+                        if not webhook_url:
+                            continue
+                        session = await self._get_fluxer_session()
+                        api_base = "https://api.fluxer.app"
+                        url = f"{api_base}/webhooks/{fid}/{webhook_url}?wait=true"
+                        form = aiohttp.FormData()
+                        form_payload = {
+                            "username": "System",
+                            "avatar_url": None,
+                            "content": leave_msg,
+                            "attachments": [],
+                        }
+                        form.add_field("payload_json", json.dumps(form_payload), content_type="application/json")
+                        try:
+                            async with session.post(url, data=form) as r:
+                                if r.status not in [200, 201]:
+                                    self.logger.warning(f"[D->F] Leave relay failed: {r.status} {await r.text()}")
+                        except Exception as exc:
+                            self.logger.warning(f"[D->F] Exception posting leave to Fluxer: {exc}")
 
             # --- Fluxer relay ---
             # Relay to all fluxer_webhook in the bridge config for this channel
