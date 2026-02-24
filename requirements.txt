@@ -1,0 +1,5 @@
+aiohttp
+py-cord
+python-telegram-bot
+requests
+telethon

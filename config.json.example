@@ -1,0 +1,24 @@
+{
+  "discord": {
+    "token": "",
+    "guild_id": 0
+  },
+  "telegram": {
+    "token": "",
+    "telegram_api_url": "tg.tabs.gay"
+  },
+  "bridges": [
+    {
+      "name": "general",
+      "discord_channel_ids": [
+        0
+      ],
+      "discord_webhooks": {
+        "0": ""
+      },
+      "telegram_chat_ids": [
+        0
+      ]
+    }
+  ]
+}
