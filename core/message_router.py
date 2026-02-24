@@ -2,7 +2,8 @@
 from typing import Any, Dict, List, Set
 
 class MessageRouter:
-    def __init__(self, discord_client, media_handler, logger, telegram_client):
+    def __init__(self, config, discord_client, media_handler, logger, telegram_client):
+        self.config = config
         self.discord_client = discord_client
         self.media_handler = media_handler
         self.logger = logger
@@ -38,9 +39,12 @@ class MessageRouter:
             return
         if from_id and (from_id < 0 or from_id in bot_user_ids):
             return
-        if from_id and from_id in username_map:
-            if username_map[from_id].lower() in getattr(mapping, 'blocked_telegram_usernames', []):
-                return
+        blocked = [u.lower() for u in getattr(self.config.telegram, 'blocked_telegram_usernames', [])]
+        self.logger.debug(f"Blocked usernames from config: {blocked}")
+        username = username_map.get(from_id, '').lower()
+        self.logger.debug(f"Checking username '{username}' (from_id={from_id}) against blocked list.")
+        if username in blocked:
+            return
         name = user_map.get(from_id, f"User_{from_id}") if from_id else "Unknown"
         avatar_url = None
         if from_id and from_id in username_map:

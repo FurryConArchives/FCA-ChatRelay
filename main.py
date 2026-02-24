@@ -40,7 +40,7 @@ class BridgeApp:
         self.discord = DiscordClient(discord_bot, self.discord_logger)
         self.telegram = TelegramClient(telegram_bot, self.telegram_logger)
         self.fluxer = FluxerClient(self.fluxer_logger)
-        self.router = MessageRouter(self.discord, self.media, self.logger, self.telegram)
+        self.router = MessageRouter(config, self.discord, self.media, self.logger, self.telegram)
         self.endpoint_poller = EndpointPoller(config, self.state_repo, self.router, self.telegram, self.logger)
         self.donation_poller = DonationPoller(config, self.router, self.logger)
 
