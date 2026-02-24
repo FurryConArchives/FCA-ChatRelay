@@ -1,9 +1,9 @@
-# FCA Telegram-Discord Bridge
+# FCA Telegram-Discord-Fluxer Bridge
 
 
-Relay messages and media between Telegram and Discord.
+Relay messages and media between Telegram, Fluxer, and Discord.
 
-**Note:** This bridge supports relaying between multiple Telegram groups and multiple Discord channels, but only within a single Discord guild (server). It does not support Discord forum channels, threads, or Telegram topics—only standard groups and channels.
+**Note:** This bridge supports relaying between multiple Telegram groups and multiple Discord/Fluxer channels, but only within a single Discord/Fluxer guild (server). It does not support Discord forum channels, threads, or Telegram topics—only standard groups and channels.
 
 ## Quick Setup
 
