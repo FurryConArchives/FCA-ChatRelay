@@ -1,0 +1,5 @@
+aiohttp
+fluxer.py
+py-cord
+python-telegram-bot
+requests
