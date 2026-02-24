@@ -9,6 +9,10 @@ class DiscordClient:
 
         @self.bot.event
         async def on_message(message):
+            # Ignore messages sent by webhooks to prevent relay loops
+            if getattr(message, 'webhook_id', None) is not None:
+                self.logger.debug(f"Ignoring webhook message (id={getattr(message, 'id', '?')}) to prevent relay loop.")
+                return
             name = getattr(message.author, 'display_name', None) or getattr(message.author, 'name', 'Unknown')
             text = getattr(message, 'content', None) or ''
             self.logger.info(f"{name}: {text}")

@@ -158,13 +158,26 @@ class MessageRouter:
             return
         if from_id and (from_id < 0 or from_id in bot_user_ids):
             return
+        blocked = [u.lower() for u in getattr(self.config.telegram, 'blocked_telegram_usernames', [])]
+        self.logger.debug(f"Blocked usernames from config: {blocked}")
+        username = username_map.get(from_id, '').lower()
+        self.logger.debug(f"Checking username '{username}' (from_id={from_id}) against blocked list.")
+        if username in blocked:
+            return
         name = user_map.get(from_id, f"User_{from_id}") if from_id else "Unknown"
-        # Media handling (if needed, implement media relay)
+        avatar_url = None
+        if from_id and from_id in username_map:
+            avatar_url = f"https://furryconarchives.org/api/telegram-avatar/{username_map[from_id]}"
+        # Media handling
+        file_payloads = await self.media_handler.telegram_to_discord(msg)
+        content = f"{name}: {text}" if text else None
         try:
-            await self.fluxer.send_message(
+            await self.fluxer.send_webhook(
                 mapping=mapping,
-                content=text,
-                author_name=name,
+                content=content,
+                file_payloads=file_payloads,
+                username=name,
+                avatar_url=avatar_url,
             )
         except Exception as exc:
             self.logger.error(f"Failed to relay Telegram message {msg_id} to Fluxer: {exc}", exc_info=True)
@@ -173,13 +186,18 @@ class MessageRouter:
         # message: discord.Message
         name = getattr(message.author, 'display_name', None) or getattr(message.author, 'name', 'Unknown')
         text = getattr(message, 'content', None) or ''
-        if not text:
+        avatar_url = getattr(message.author, 'avatar_url', None)
+        file_payloads = await self.media_handler.discord_to_fluxer(message)
+        content = f"{name}: {text}" if text else None
+        if not content and not file_payloads:
             return
         try:
-            await self.fluxer.send_message(
+            await self.fluxer.send_webhook(
                 mapping=mapping,
-                content=text,
-                author_name=name,
+                content=content,
+                file_payloads=file_payloads,
+                username=name,
+                avatar_url=avatar_url,
             )
             self.logger.info(f"Relayed Discord message {getattr(message, 'id', '?')} to Fluxer")
         except Exception as exc:

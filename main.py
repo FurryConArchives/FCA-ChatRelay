@@ -70,7 +70,7 @@ if __name__ == "__main__":
     logging.getLogger("httpx").setLevel(logging.CRITICAL)
     logging.getLogger("telegram").setLevel(logging.CRITICAL)
     logging.getLogger("apscheduler").setLevel(logging.CRITICAL)
-    logging.getLogger("fluxer").setLevel(logging.CRITICAL)
+    #logging.getLogger("fluxer").setLevel(logging.CRITICAL)
 
     config_path = os.environ.get("BRIDGE_CONFIG", "config.json")
     config = load_config(config_path)
