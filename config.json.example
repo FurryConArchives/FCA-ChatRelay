@@ -5,18 +5,24 @@
   },
   "telegram": {
     "token": "",
+    "blocked_telegram_usernames": ["fcarelay_bot", "countersignbot"],
     "telegram_api_url": "tg.tabs.gay"
   },
+  "fluxer": {
+    "token": "",
+    "guild_id": 0
+  },
+  "fluxer_token": "",
   "bridges": [
     {
       "name": "general",
-      "discord_channel_ids": [
-        0
-      ],
-      "discord_webhooks": {
-        "0": ""
+      "discord_webhook": {
+        "0": "https://web.hook"
       },
-      "telegram_chat_ids": [
+      "fluxer_webhook": {
+        "0": "https://web.hook"
+      },
+      "telegram_chat_id": [
         0
       ]
     }

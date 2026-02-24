@@ -1,81 +1,210 @@
 from __future__ import annotations
-
 import asyncio
+import os
 import io
+import json
 import logging
 import sqlite3
 import aiohttp
 import discord
-
+import fluxer
 from typing import Awaitable, Callable, Iterable, Optional, Sequence, Tuple
 from discord.ext import commands
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
-
 from .config import AppConfig, BridgeMapping, load_config
 
 
 class BridgeApp:
-    async def _poll_latest_donation(self) -> None:
-        """
-        Periodically scan the latest donation API and alert both Discord and Telegram if a new donation is detected.
-        """
-        last_donation_id = None
-        while True:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    url = "https://furryconarchives.org/api/latest-donation"
-                    async with session.get(url, timeout=10) as response:
-                        if response.status != 200:
-                            self.logger.warning("Failed to fetch latest donation: %s", response.status)
-                            await asyncio.sleep(60)
-                            continue
-                        data = await response.json()
-                        donation = data.get("latest_donation", {})
-                        name = donation.get("name", "Anonymous")
-                        amount = donation.get("amount", "0.00")
-                        discord_username = donation.get("discord_username", "")
-
-                        donation_id = f"{name}-{amount}-{discord_username}"
-                        if donation_id == last_donation_id:
-                            await asyncio.sleep(60)
-                            continue
-                        last_donation_id = donation_id
-
-                        # Strip #0000 if present
-                        if discord_username:
-                            discord_username = discord_username.split('#')[0]
-                        message = f"{discord_username} donated ${amount}"
-                        await self.alert_kofi_donation(name, float(amount), message)
-                        self.logger.info(f"Donation alert sent: {message}")
-            except Exception as exc:
-                self.logger.error(f"Error polling latest donation: {exc}", exc_info=True)
-            await asyncio.sleep(60)
     def __init__(self, config_path: str) -> None:
         self.config: AppConfig = load_config(config_path)
-        self.logger = logging.getLogger("BridgeApp")
+        self.logger = logging.getLogger("FCA MultiBridge")
         self.discord_bot: Optional[commands.Bot] = None
         self.telegram_app = None
         self.discord_ready = asyncio.Event()
         self.processed_message_ids: dict[int, set[int]] = {}
-        self.blocked_telegram_usernames = {"fcarelay_bot", "countersignbot"}
-
+        self.dwebhooks = {}
+        self.fwebhooks = {}
+        self.session = None
         self.db_path = "bridge_state.db"
         self._init_database()
         self._load_processed_message_ids()
+        intents = fluxer.Intents.all()
+        self.fluxer_bot = fluxer.Bot(intents=intents)
+
+    async def _get_fluxer_session(self):
+        if self.session is None or self.session.closed:
+            token = self.config.fluxer.token
+            if not token:
+                raise RuntimeError("Fluxer token not found in config. Please add 'token' to your fluxer config and AppConfig.")
+            auth = f"Bot {token}" if not str(token).startswith("Bot ") else str(token)
+            self.session = aiohttp.ClientSession(headers={"Authorization": auth})
+        return self.session
+
+    async def _download_fluxer_file(self, url):
+        session = await self._get_fluxer_session()
+        try:
+            async with session.get(url) as r:
+                if r.status == 200:
+                    data = await r.read()
+                    filename = url.split("?")[0].split("/")[-1] or "file"
+                    return data, filename
+                else:
+                    self.logger.warning(f"Fluxer download failed {url}: HTTP {r.status}")
+        except Exception as e:
+            self.logger.warning(f"Fluxer download failed {url}: {e}")
+        return None, None
+
+    async def _get_discord_webhook(self, channel):
+        if channel.id in self.dwebhooks:
+            return self.dwebhooks[channel.id]
+        try:
+            webhooks = await channel.webhooks()
+            webhook = discord.utils.get(webhooks, name="Flux Bridge")
+            if not webhook:
+                webhook = await channel.create_webhook(name="Flux Bridge")
+            self.dwebhooks[channel.id] = webhook
+            return webhook
+        except Exception:
+            return None
+
+    async def _get_fluxer_webhook(self, fchannelid):
+        if fchannelid in self.fwebhooks:
+            return self.fwebhooks[fchannelid]
+        session = await self._get_fluxer_session()
+        api_base = "https://api.fluxer.app"
+        try:
+            async with session.get(f"{api_base}/channels/{fchannelid}/webhooks") as r:
+                if r.status == 200:
+                    data = await r.json()
+                    webhook = next((w for w in data if w.get('name') == "Discord Bridge"), None)
+                    if webhook:
+                        self.fwebhooks[fchannelid] = webhook
+                        return webhook
+            async with session.post(f"{api_base}/channels/{fchannelid}/webhooks", json={"name": "Discord Bridge"}) as r:
+                if r.status in [200, 201]:
+                    webhook = await r.json()
+                    self.fwebhooks[fchannelid] = webhook
+                    return webhook
+        except Exception as e:
+            self.logger.warning(f"Failed to get/create Fluxer webhook for {fchannelid}: {e}")
+        return None
+
+    def _is_discord_webhook(self, message):
+        webhook_id = getattr(message, 'webhook_id', None)
+        if not webhook_id:
+            return False
+        cached = self.dwebhooks.get(message.channel_id)
+        return cached is not None and webhook_id == cached.id
+
+    def _is_fluxer_webhook(self, message):
+        webhookid = getattr(message, 'webhook_id', None)
+        if not webhookid:
+            return False
+        channelid = str(message.channel_id)
+        cached = self.fwebhooks.get(channelid)
+        return cached is not None and str(webhookid) == str(cached['id'])
+
+    def _setup_fluxer_events(self):
+        @self.fluxer_bot.event
+        async def on_ready():
+            self.logger.info("Fluxer connected as %s", self.fluxer_bot.user)
+
+        @self.fluxer_bot.event
+        async def on_message(message):
+            self.logger.debug(f"[Fluxer] Received message: {getattr(message, 'content', None)} from {getattr(message.author, 'username', None)} in channel {getattr(message, 'channel_id', None)}")
+            if self._is_fluxer_webhook(message):
+                return
+            if message.author.id == self.fluxer_bot.user.id or getattr(message.author, 'bot', False):
+                return
+            did = None
+            for mapping in self.config.bridges:
+                for discord_channel_id, fluxer_webhook_dict in getattr(mapping, 'fluxer_webhook', {}).items():
+                    if str(message.channel_id) in mapping.fluxer_webhook:
+                        did = discord_channel_id
+                        break
+                if did:
+                    break
+            if not did:
+                return
+            channel = self.discord_bot.get_channel(int(did))
+            if not channel:
+                return
+            replyhead = ""
+            try:
+                session = await self._get_fluxer_session()
+                refid = None
+                api_base = "https://api.fluxer.app"
+                async with session.get(f"{api_base}/channels/{message.channel_id}/messages/{message.id}") as r:
+                    if r.status == 200:
+                        raw = await r.json()
+                        ref = raw.get('referenced_message') or raw.get('reply_to')
+                        if isinstance(ref, dict):
+                            refid = ref.get('id')
+                        elif isinstance(ref, str):
+                            refid = ref
+                if refid:
+                    db = sqlite3.connect("messages.db")
+                    res = db.execute("SELECT discord_id FROM msgmap WHERE fluxer_id = ?", (str(refid),)).fetchone()
+                    db.close()
+                    if res:
+                        msgurl = f"https://discord.com/channels/{channel.guild.id}/{did}/{res[0]}"
+                        try:
+                            origmsg = await channel.fetch_message(int(res[0]))
+                            mention = origmsg.author.mention
+                        except Exception:
+                            mention = ""
+                        replyhead = f"-# -> {msgurl} {mention}\n"
+            except Exception as e:
+                self.logger.warning(f"[F->D] Reply lookup error: {e}")
+            webhook = await self._get_discord_webhook(channel)
+            if not webhook:
+                return
+            files = []
+            for a in (message.attachments or []):
+                if isinstance(a, dict):
+                    atturl = a.get("url") or a.get("proxy_url")
+                else:
+                    atturl = getattr(a, "url", None) or getattr(a, "proxy_url", None)
+                if atturl:
+                    data, filename = await self._download_fluxer_file(atturl)
+                    if data:
+                        files.append(discord.File(io.BytesIO(data), filename=filename))
+            try:
+                username = message.author.username
+                avatar_url = str(message.author.avatar_url)
+                content = f"{replyhead}{message.content}".strip() or None
+                if content or files:
+                    await webhook.send(
+                        content=content,
+                        username=username,
+                        avatar_url=avatar_url,
+                        files=files if files else None,
+                        wait=True,
+                    )
+                    db = sqlite3.connect("messages.db")
+                    fchan = await self.fluxer_bot.fetch_channel(str(message.channel_id))
+                    sid = getattr(fchan, "guild_id", "0")
+                    db.execute(
+                        "INSERT INTO msgmap VALUES (?, ?, ?, ?, ?)",
+                        (
+                            str(0),
+                            str(message.id),
+                            did,
+                            str(message.author.id),
+                            str(sid),
+                        ),
+                    )
+                    db.commit()
+                    db.close()
+            except Exception as e:
+                self.logger.warning(f"[F->D] Webhook send error: {e}")
+
 
     async def alert_kofi_donation(self, donor_name: str, amount: float, message: str = "") -> None:
-        """
-        Alert both Discord and Telegram chats about a Ko-fi donation.
-        Args:
-            donor_name: Name of the donor.
-            amount: Donation amount.
-            message: Optional message from the donor.
-        """
-        alert_text = f"☕ Donation received!\nDonor: {donor_name}\nAmount: ${amount:.2f}"
+        alert_text = f"Donation received!\nDonor: {donor_name}\nAmount: ${amount:.2f}"
         if message:
             alert_text += f"\nMessage: {message}"
-
         for mapping in self.config.bridges:
             await self._send_to_discord_channels(
                 mapping,
@@ -89,7 +218,6 @@ class BridgeApp:
 
 
     def _init_database(self) -> None:
-        """Initialize SQLite database for tracking processed message IDs."""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -106,7 +234,6 @@ class BridgeApp:
         except Exception as exc:
             self.logger.warning("Failed to initialize database: %s", exc)
     def _load_processed_message_ids(self) -> None:
-        """Load processed message IDs from database."""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -122,7 +249,6 @@ class BridgeApp:
         except Exception as exc:
             self.logger.warning("Failed to load message IDs from database: %s", exc)
     def _save_last_message_id(self, chat_id: int, message_id: int) -> None:
-        """Save processed message ID to database."""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -137,12 +263,12 @@ class BridgeApp:
             self.logger.warning("Failed to save message ID to database: %s", exc)
     def _find_by_discord(self, channel_id: int) -> Optional[BridgeMapping]:
         for mapping in self.config.bridges:
-            if channel_id in mapping.discord_channel_ids:
+            if channel_id in mapping.discord_webhook:
                 return mapping
         return None
     def _find_by_telegram(self, chat_id: int) -> Optional[BridgeMapping]:
         for mapping in self.config.bridges:
-            if chat_id in mapping.telegram_chat_ids:
+            if chat_id in mapping.telegram_chat_id:
                 return mapping
         return None
     async def _retry(self, action: Callable[[], Awaitable[None]], label: str) -> bool:
@@ -265,7 +391,7 @@ class BridgeApp:
                 return
     
             if from_id and from_id in username_map:
-                if username_map[from_id].lower() in self.blocked_telegram_usernames:
+                if username_map[from_id].lower() in self.config.telegram.blocked_telegram_usernames:
                     return
     
             # Mark as processed
@@ -367,8 +493,7 @@ class BridgeApp:
             self.logger.error(f"Failed to process endpoint message: {exc}", exc_info=True)
 
     async def _poll_endpoint_periodically(self) -> None:
-        """Periodically fetch messages from the endpoint."""
-        await asyncio.sleep(2)  # Wait for Discord to be ready
+        await asyncio.sleep(2)
         self.logger.info("Starting endpoint polling task")
         poll_count = 0
         while True:
@@ -376,11 +501,10 @@ class BridgeApp:
                 poll_count += 1
                 for mapping in self.config.bridges:
                     try:
-                        for chat_id in mapping.telegram_chat_ids:
+                        for chat_id in mapping.telegram_chat_id:
                             try:
                                 messages, user_map, username_map, bot_user_ids = await self._fetch_endpoint_messages(chat_id, limit=15)
                                 self.logger.debug(f"[Poll #{poll_count}] Fetched {len(messages)} messages for chat_id={chat_id}")
-                                # Process in reverse chronological order (oldest first)
                                 for msg in reversed(messages):
                                     try:
                                         msg_id = msg.get("id")
@@ -394,15 +518,14 @@ class BridgeApp:
                     except Exception as mapping_exc:
                         self.logger.error(f"Error processing mapping: {mapping_exc}", exc_info=True)
                         continue
-                    
                 self.logger.debug(f"[Poll #{poll_count}] Completed, sleeping 5 seconds")
-                await asyncio.sleep(5)  # Fetch every 5 seconds for near-realtime
+                await asyncio.sleep(5)
             except asyncio.CancelledError:
                 self.logger.info("Polling task cancelled")
                 raise
             except Exception as exc:
                 self.logger.error(f"Unexpected error in polling loop: {exc}", exc_info=True)
-                await asyncio.sleep(10)  # Back off on error
+                await asyncio.sleep(10)
     def _build_discord_files(self, file_payloads: Sequence[Tuple[bytes, str]]) -> list[discord.File]:
         files: list[discord.File] = []
         for data, filename in file_payloads:
@@ -420,11 +543,10 @@ class BridgeApp:
         if not self.discord_bot:
             self.logger.error("Discord bot not initialized")
             return
-        self.logger.debug(f"_send_to_discord_channels called with {len(mapping.discord_channel_ids)} channels")
-        for channel_id in mapping.discord_channel_ids:
+        self.logger.debug(f"_send_to_discord_channels called with {len(mapping.discord_webhook)} channels")
+        for channel_id, webhook_url in mapping.discord_webhook.items():
             self.logger.debug(f"Attempting to send to Discord channel {channel_id}")
             files = self._build_discord_files(file_payloads)
-            webhook_url = mapping.discord_webhooks.get(channel_id)
             if webhook_url:
                 try:
                     async with aiohttp.ClientSession() as session:
@@ -455,7 +577,6 @@ class BridgeApp:
             if prefixed_content is None and not files:
                 self.logger.warning(f"No content and no files for channel {channel_id}, skipping")
                 continue
-            
             self.logger.info(f"Sending to Discord channel {channel_id}: {prefixed_content[:60] if prefixed_content else 'files only'}")
             try:
                 await channel.send(prefixed_content, files=files)
@@ -465,7 +586,7 @@ class BridgeApp:
     async def _send_to_telegram_chats(
         self, mapping: BridgeMapping, content: Optional[str], attachments: Iterable[discord.Attachment]
     ) -> None:
-        for chat_id in mapping.telegram_chat_ids:
+        for chat_id in mapping.telegram_chat_id:
             if content:
                 await self.telegram_app.bot.send_message(chat_id=chat_id, text=content)
             for attachment in attachments:
@@ -476,7 +597,7 @@ class BridgeApp:
     async def _send_to_telegram_text(self, mapping: BridgeMapping, content: Optional[str]) -> None:
         if not content:
             return
-        for chat_id in mapping.telegram_chat_ids:
+        for chat_id in mapping.telegram_chat_id:
             try:
                 await self.telegram_app.bot.send_message(chat_id=chat_id, text=content)
                 self.logger.debug(f"Sent text to Telegram chat {chat_id}")
@@ -488,7 +609,7 @@ class BridgeApp:
         content: Optional[str],
         file_payloads: Sequence[Tuple[bytes, str, Optional[str]]],
     ) -> None:
-        for chat_id in mapping.telegram_chat_ids:
+        for chat_id in mapping.telegram_chat_id:
             try:
                 if content:
                     await self.telegram_app.bot.send_message(chat_id=chat_id, text=content)
@@ -517,8 +638,7 @@ class BridgeApp:
             return
         if update.effective_user and update.effective_user.username:
             username = update.effective_user.username.lower()
-            if username in self.blocked_telegram_usernames:
-                self.logger.info("Skipping blocked Telegram bot: %s", username)
+            if username in self.config.telegramblocked_telegram_usernames:
                 return
         if msg_id:
             self.processed_message_ids[chat_id].add(msg_id)
@@ -628,10 +748,48 @@ class BridgeApp:
             name,
             avatar_url,
         )
+
+        bridge = None
+        chat_id_str = str(chat_id)
+        for b in self.config.bridges:
+            if hasattr(b, 'telegram_chat_id') and chat_id in getattr(b, 'telegram_chat_id', []):
+                bridge = b
+                break
+        if bridge and hasattr(bridge, 'fluxer_webhook'):
+            fluxer_webhooks = getattr(bridge, 'fluxer_webhook', {})
+            for fid, webhook_url in fluxer_webhooks.items():
+                if not webhook_url:
+                    continue
+                session = await self._get_fluxer_session()
+                api_base = "https://api.fluxer.app"
+                url = f"{api_base}/webhooks/{fid}/{webhook_url}?wait=true"
+                form = aiohttp.FormData()
+                # Use display_name, fallback to username
+                display_name = name
+                avatar_url_fluxer = avatar_url
+                form_payload = {
+                    "username": display_name,
+                    "avatar_url": avatar_url_fluxer,
+                    "attachments": [],
+                }
+                text_fluxer = text.strip() if text else None
+                if text_fluxer:
+                    form_payload["content"] = text_fluxer
+                for i, (data, filename) in enumerate(file_payloads):
+                    form_payload["attachments"].append({"id": i, "filename": filename})
+                    form.add_field(f"files[{i}]", data, filename=filename, content_type="application/octet-stream")
+                form.add_field("payload_json", json.dumps(form_payload), content_type="application/json")
+                try:
+                    async with session.post(url, data=form) as r:
+                        if r.status not in [200, 201]:
+                            self.logger.warning(f"[T->F] Message post failed: {r.status} {await r.text()}")
+                except Exception as exc:
+                    self.logger.warning(f"[T->F] Exception posting to Fluxer: {exc}")
     async def start(self) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
         self.discord_bot = commands.Bot(command_prefix="!", intents=intents)
+
         @self.discord_bot.event
         async def on_ready() -> None:
             self.logger.info("Discord connected as %s", self.discord_bot.user)
@@ -657,24 +815,65 @@ class BridgeApp:
             await self._send_to_telegram_chats(mapping, content, message.attachments)
             await self.discord_bot.process_commands(message)
 
-        @self.discord_bot.event
-        async def on_member_join(member: discord.Member) -> None:
-            # Relay Discord member join to Telegram
-            self.logger.info(f"Discord member joined: {member.display_name}")
-            # Find all mappings that include this guild
-            for mapping in self.config.bridges:
-                if member.guild and member.guild.id in mapping.discord_guild_ids:
-                    join_msg = f"📌 {member.display_name or 'Unknown'} joined the Discord Chat"
-                    await self._send_to_telegram_text(mapping, join_msg)
+            # --- Fluxer relay ---
+            # Relay to all fluxer_webhook in the bridge config for this channel
+            cid = str(message.channel.id)
+            for bridge in self.config.bridges:
+                if hasattr(bridge, "discord_webhook") and int(cid) in bridge.discord_webhook:
+                    fluxer_webhook = getattr(bridge, "fluxer_webhook", {})
+                    for fid, webhook_url in fluxer_webhook.items():
+                        if not webhook_url:
+                            continue
+                        replyhead = ""
+                        if message.reference and message.reference.message_id:
+                            db = sqlite3.connect("messages.db")
+                            res = db.execute("SELECT fluxer_id, fluxer_author_id, server_id FROM msgmap WHERE discord_id = ?", (str(message.reference.message_id),)).fetchone()
+                            db.close()
+                            if res:
+                                replyhead = f"-# → <https://fluxer.app/channels/{res[2]}/{fid}/{res[0]}> <@{res[1]}>\n"
+                        session = await self._get_fluxer_session()
+                        api_base = "https://api.fluxer.app"
+                        url = f"{api_base}/webhooks/{fid}/{webhook_url}?wait=true"
+                        lastfmsg = None
+                        form = aiohttp.FormData()
+                        display_name = getattr(message.author, "display_name", None) or getattr(message.author, "username", "Unknown")
+                        avatar_url = str(getattr(message.author, "display_avatar", getattr(message.author, "avatar_url", "")))
+                        form_payload = {
+                            "username": display_name,
+                            "avatar_url": avatar_url,
+                            "attachments": [],
+                        }
+                        text = f"{replyhead}{message.clean_content}".strip()
+                        if text: form_payload["content"] = text
+                        for i, attachment in enumerate(message.attachments):
+                            data, filename = await self._download_fluxer_file(attachment.url)
+                            if data:
+                                form_payload["attachments"].append({"id": i, "filename": filename})
+                                form.add_field(f"files[{i}]", data, filename=filename, content_type="application/octet-stream")
+                        form.add_field("payload_json", json.dumps(form_payload), content_type="application/json")
+                        async with session.post(url, data=form) as r:
+                            if r.status in [200, 201]: lastfmsg = await r.json()
+                            else: self.logger.warning(f"[D->F] Message post failed: {r.status} {await r.text()}")
+                        if lastfmsg:
+                            db = sqlite3.connect("messages.db")
+                            fchan = await self.fluxer_bot.fetch_channel(fid)
+                            sid = getattr(fchan, "guild_id", "0")
+                            db.execute(
+                                "INSERT INTO msgmap VALUES (?, ?, ?, ?, ?)",
+                                (
+                                    str(message.id),
+                                    str(lastfmsg["id"]),
+                                    cid,
+                                    str(lastfmsg["author"]["id"]),
+                                    str(sid),
+                                ),
+                            )
+                            db.commit()
+                            db.close()
 
-        @self.discord_bot.event
-        async def on_member_remove(member: discord.Member) -> None:
-            # Relay Discord member leave to Telegram
-            self.logger.info(f"Discord member left: {member.display_name}")
-            for mapping in self.config.bridges:
-                if member.guild and member.guild.id in mapping.discord_guild_ids:
-                    leave_msg = f"📍 {member.display_name or 'Unknown'} left the Discord Chat"
-                    await self._send_to_telegram_text(mapping, leave_msg)
+        # Remove on_member_join and on_member_remove events, as discord_guild_ids is no longer present in BridgeMapping
+
+        self._setup_fluxer_events()
         self.telegram_app = ApplicationBuilder().token(self.config.telegram.token).build()
         self.telegram_app.add_handler(
             MessageHandler(filters.ALL & ~filters.COMMAND, self._handle_telegram)
@@ -702,6 +901,44 @@ class BridgeApp:
             except Exception as exc:
                 self.logger.error(f"CRITICAL: Donation polling task crashed: {exc}", exc_info=True)
         donation_task.add_done_callback(donation_task_exception_handler)
+        # Start Discord and Fluxer bots
         discord_task = asyncio.create_task(self.discord_bot.start(self.config.discord.token))
+        fluxer_task = asyncio.create_task(self.fluxer_bot.start(self.config.fluxer.token))
         await self.discord_ready.wait()
-        await discord_task
+        await asyncio.gather(discord_task, fluxer_task)
+
+    async def _poll_latest_donation(self) -> None:
+        """
+        Periodically scan the latest donation API and alert both Discord and Telegram if a new donation is detected.
+        """
+        last_donation_id = None
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    url = "https://furryconarchives.org/api/latest-donation"
+                    async with session.get(url, timeout=10) as response:
+                        if response.status != 200:
+                            self.logger.warning("Failed to fetch latest donation: %s", response.status)
+                            await asyncio.sleep(60)
+                            continue
+                        data = await response.json()
+                        donation = data.get("latest_donation", {})
+                        name = donation.get("name", "Anonymous")
+                        amount = donation.get("amount", "0.00")
+                        discord_username = donation.get("discord_username", "")
+
+                        donation_id = f"{name}-{amount}-{discord_username}"
+                        if donation_id == last_donation_id:
+                            await asyncio.sleep(60)
+                            continue
+                        last_donation_id = donation_id
+
+                        # Strip #0000 if present
+                        if discord_username:
+                            discord_username = discord_username.split('#')[0]
+                        message = f"{discord_username} donated ${amount}"
+                        await self.alert_kofi_donation(name, float(amount), message)
+                        self.logger.info(f"Donation alert sent: {message}")
+            except Exception as exc:
+                self.logger.error(f"Error polling latest donation: {exc}", exc_info=True)
+            await asyncio.sleep(60)

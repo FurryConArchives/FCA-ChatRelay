@@ -10,19 +10,24 @@ class DiscordConfig:
     token: str
     guild_id: int
 
+@dataclass(frozen=True)
+class FluxerConfig:
+    token: str
+    guild_id: int
 
 @dataclass(frozen=True)
 class TelegramConfig:
     token: str
+    blocked_telegram_usernames: List[str]
     telegram_api_url: str
 
 
 @dataclass(frozen=True)
 class BridgeMapping:
     name: str
-    discord_channel_ids: List[int]
-    telegram_chat_ids: List[int]
-    discord_webhooks: Dict[int, str]
+    discord_webhook: Dict[int, str]
+    fluxer_webhook: Dict[int, str]
+    telegram_chat_id: List[int]
 
 
 @dataclass(frozen=True)
@@ -30,6 +35,7 @@ class AppConfig:
     discord: DiscordConfig
     telegram: TelegramConfig
     bridges: List[BridgeMapping]
+    fluxer: FluxerConfig
 
 
 def load_config(path: str) -> AppConfig:
@@ -38,31 +44,40 @@ def load_config(path: str) -> AppConfig:
 
     discord_raw = raw.get("discord", {})
     telegram_raw = raw.get("telegram", {})
+    fluxer_raw = raw.get("fluxer", {})
     bridges_raw = raw.get("bridges", [])
 
     discord = DiscordConfig(
         token=str(discord_raw.get("token", "")),
         guild_id=int(discord_raw.get("guild_id", 0)),
     )
+
+    fluxer = FluxerConfig(
+        token=str(fluxer_raw.get("token", "")),
+        guild_id=int(fluxer_raw.get("guild_id", 0)),
+    )
+
     telegram = TelegramConfig(
         token=str(telegram_raw.get("token", "")),
+        blocked_telegram_usernames=telegram_raw.get("blocked_telegram_usernames", []),
         telegram_api_url=str(telegram_raw.get("telegram_api_url", "")),
     )
 
     bridges: List[BridgeMapping] = []
     for item in bridges_raw:
         name = str(item.get("name", ""))
-        discord_ids = [int(value) for value in item.get("discord_channel_ids", [])]
-        telegram_ids = [int(value) for value in item.get("telegram_chat_ids", [])]
-        raw_webhooks = item.get("discord_webhooks", {})
-        discord_webhooks = {int(key): str(value) for key, value in raw_webhooks.items()}
+        telegram_ids = [int(value) for value in item.get("telegram_chat_id", [])]
+        raw_discord_webhooks = item.get("discord_webhook", {})
+        discord_webhook = {int(key): str(value) for key, value in raw_discord_webhooks.items()}
+        raw_fluxer_webhooks = item.get("fluxer_webhook", {})
+        fluxer_webhook = {int(key): str(value) for key, value in raw_fluxer_webhooks.items()}
         bridges.append(
             BridgeMapping(
                 name=name,
-                discord_channel_ids=discord_ids,
-                telegram_chat_ids=telegram_ids,
-                discord_webhooks=discord_webhooks
+                discord_webhook=discord_webhook,
+                fluxer_webhook=fluxer_webhook,
+                telegram_chat_id=telegram_ids
             )
         )
 
-    return AppConfig(discord=discord, telegram=telegram, bridges=bridges)
+    return AppConfig(discord=discord, telegram=telegram, bridges=bridges, fluxer=fluxer)
