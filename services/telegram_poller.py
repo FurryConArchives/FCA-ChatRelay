@@ -1,7 +1,7 @@
 import asyncio
 from typing import Any
 
-class EndpointPoller:
+class TelegramPoller:
     def __init__(self, config, state_repo, router, telegram_client, logger):
         self.config = config
         self.state_repo = state_repo

@@ -4,13 +4,29 @@ from typing import Any, Optional
 
 import fluxer
 
+
 class FluxerClient:
-    def __init__(self, logger):
-        self.bot = fluxer.Bot(intents=fluxer.Intents.all())
+    def __init__(self, bot, logger, router=None):
+        self.bot = bot
         self.logger = logger
+        self.router = router
+        self._on_message_callback = None
+
+        @self.bot.event
+        async def on_message(message):
+            self.logger.info(f"{getattr(getattr(message, 'author', None), 'username', None)}: {getattr(message, 'content', None)}")
+            if self.router:
+                await self.router.relay_fluxer_to_discord(message)
+                await self.router.relay_fluxer_to_telegram(message)
+            elif self._on_message_callback:
+                await self._on_message_callback(message)
+
+    def set_on_message(self, callback):
+        self._on_message_callback = callback
 
     async def start(self, token):
         self.logger.info("Starting Fluxer bot")
+        await self.bot.start(token)
      
     async def send_webhook(self, mapping: Any, content: Optional[str], file_payloads: Optional[list] = None, username: Optional[str] = None, avatar_url: Optional[str] = None):
         """Relay a message to a Fluxer webhook endpoint."""

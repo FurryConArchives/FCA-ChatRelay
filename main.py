@@ -6,7 +6,7 @@ from core.message_router import MessageRouter
 from transports.discord_client import DiscordClient
 from transports.telegram_client import TelegramClient
 from transports.fluxer_client import FluxerClient
-from services.endpoint_poller import EndpointPoller
+from services.telegram_poller import TelegramPoller
 from services.donation_poller import DonationPoller
 import logging
 import asyncio
@@ -37,11 +37,13 @@ class BridgeApp:
         # --- Bot inits --
         discord_bot = commands.Bot(intents=discord.Intents.all())
         telegram_bot = ApplicationBuilder().token(config.telegram.token).build()
+        fluxer_bot = fluxer.Bot(intents=fluxer.Intents.all())
         self.discord = DiscordClient(discord_bot, self.discord_logger)
         self.telegram = TelegramClient(telegram_bot, self.telegram_logger)
-        self.fluxer = FluxerClient(self.fluxer_logger)
-        self.router = MessageRouter(config, self.discord, self.media, self.logger, self.telegram)
-        self.endpoint_poller = EndpointPoller(config, self.state_repo, self.router, self.telegram, self.logger)
+        self.router = MessageRouter(config, self.discord, self.media, self.logger, self.telegram, self.msgmap_repo)
+        self.fluxer = FluxerClient(fluxer_bot, self.fluxer_logger, self.router)
+        self.router = MessageRouter(config, self.discord, self.media, self.logger, self.telegram, self.msgmap_repo)
+        self.telegram_poller = TelegramPoller(config, self.state_repo, self.router, self.telegram, self.logger)
         self.donation_poller = DonationPoller(config, self.router, self.logger)
 
     async def start(self):
@@ -53,7 +55,7 @@ class BridgeApp:
             tasks.append(asyncio.create_task(self.telegram.start()))
         if self.config.fluxer.enabled:
             tasks.append(asyncio.create_task(self.fluxer.start(self.config.fluxer.token)))
-        tasks.append(asyncio.create_task(self.endpoint_poller.start()))
+        tasks.append(asyncio.create_task(self.telegram_poller.start()))
         tasks.append(asyncio.create_task(self.donation_poller.start()))
         await asyncio.gather(*tasks)
 
@@ -68,6 +70,7 @@ if __name__ == "__main__":
     logging.getLogger("httpx").setLevel(logging.CRITICAL)
     logging.getLogger("telegram").setLevel(logging.CRITICAL)
     logging.getLogger("apscheduler").setLevel(logging.CRITICAL)
+    logging.getLogger("fluxer").setLevel(logging.CRITICAL)
 
     config_path = os.environ.get("BRIDGE_CONFIG", "config.json")
     config = load_config(config_path)

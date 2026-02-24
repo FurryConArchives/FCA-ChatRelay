@@ -7,10 +7,16 @@ class DiscordClient:
         self.bot = bot
         self.logger = logger
 
+        @self.bot.event
+        async def on_message(message):
+            name = getattr(message.author, 'display_name', None) or getattr(message.author, 'name', 'Unknown')
+            text = getattr(message, 'content', None) or ''
+            self.logger.info(f"{name}: {text}")
+
     async def start(self, token):
         self.logger.info("Starting Discord bot")
         await self.bot.start(token)
-
+        
     async def send_message(self, mapping: Any, content: Optional[str], prefixed_content: Optional[str], file_payloads: Sequence[Tuple[bytes, str]], display_name: str, avatar_url: Optional[str]):
         # mapping.discord_webhook: Dict[int, str]
         import aiohttp
@@ -26,7 +32,6 @@ class DiscordClient:
                             avatar_url=avatar_url,
                             files=files if files else None,
                         )
-                    self.logger.info(f"Sent to Discord via webhook for channel {channel_id}")
                     continue
                 channel = self.bot.get_channel(channel_id)
                 if channel is None:
